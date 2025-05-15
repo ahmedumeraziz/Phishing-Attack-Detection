@@ -3,3 +3,4 @@ requests
 dnspython
 validators
 whois
+beautifulsoup4
