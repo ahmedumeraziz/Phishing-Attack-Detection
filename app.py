@@ -9,14 +9,16 @@ from urllib.parse import urlparse
 from datetime import datetime
 
 # --- Config ---
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY")       or st.secrets.get("GROQ_API_KEY", "")
-GOOD_DOMAINS       = {"google.com", "microsoft.com", "github.com"}    # expand as needed
-BLACKLISTED_DOMAINS= {"bad-domain.com", "malicious.org"}             # expand as needed
+GROQ_API_KEY        = os.getenv("GROQ_API_KEY")       or st.secrets.get("GROQ_API_KEY", "")
+GOOD_DOMAINS        = {"google.com", "microsoft.com", "github.com"}
+BLACKLISTED_DOMAINS = {"bad-domain.com", "malicious.org"}
+
+# chunk size (chars) to keep each prompt under TPM
+MAX_CHUNK_SIZE = 2000
 
 st.set_page_config(page_title="AI Phishing Detector", layout="centered")
 st.title("📧 AI-Powered Phishing Detector & Responder")
 
-# --- Inputs ---
 sender_email = st.text_input("Sender Email Address:")
 email_input  = st.text_area("Email / Message Content:", height=250)
 
@@ -35,76 +37,66 @@ if st.button("Analyze for Phishing"):
     # --- Sender Domain Checks ---
     domain = sender_email.split("@")[-1].lower()
     st.markdown("### 📨 Sender Domain Verification")
-    # MX lookup
     try:
         dns.resolver.resolve(domain, 'MX')
         st.success(f"✅ MX record found for `{domain}`")
     except Exception as e:
         st.error(f"❌ No MX record for `{domain}`: {e}")
-
-    # Whitelist / Blacklist
     if domain in GOOD_DOMAINS:
-        st.info(f"✅ Domain `{domain}` is in our **whitelist**.")
+        st.info(f"✅ `{domain}` is whitelisted.")
     if domain in BLACKLISTED_DOMAINS:
-        st.error(f"⚠️ Domain `{domain}` is in our **blacklist**.")
+        st.error(f"⚠️ `{domain}` is blacklisted.")
 
-    # --- Link Extraction & Heuristic Checks ---
+    # --- URL Heuristics (as before) ---
     st.markdown("### 🌐 URL Heuristics")
     urls = set(re.findall(r'(https?://[^\s]+)', email_input))
     if not urls:
-        st.info("🔍 No URLs detected in the message.")
+        st.info("🔍 No URLs detected.")
     else:
         for url in urls:
-            parsed = urlparse(url)
-            netloc = parsed.netloc.lower()
-
-            # 1) Reachability & HTTPS
+            parsed = urlparse(url); netloc = parsed.netloc.lower()
+            # reachability & HTTPS
             try:
-                resp = requests.head(url, timeout=5, allow_redirects=True)
-                code = resp.status_code
-                proto = parsed.scheme.upper()
-                if code < 400 and proto == "HTTPS":
-                    st.success(f"🟢 {url} → reachable ({code}), uses HTTPS")
+                r = requests.head(url, timeout=5, allow_redirects=True)
+                code = r.status_code; proto = parsed.scheme.upper()
+                if code < 400 and proto=="HTTPS":
+                    st.success(f"🟢 {url} → {code}, HTTPS")
                 elif code < 400:
-                    st.warning(f"🟡 {url} → reachable ({code}), but not HTTPS")
+                    st.warning(f"🟡 {url} → {code}, no HTTPS")
                 else:
                     st.error(f"🔴 {url} → HTTP {code}")
             except Exception as e:
-                st.error(f"❌ {url} → not reachable: {e}")
-
-            # 2) Domain Age via WHOIS
+                st.error(f"❌ {url} unreachable: {e}")
+            # WHOIS age
             try:
                 info = whois.whois(netloc)
                 creation = info.creation_date
-                if isinstance(creation, list):
-                    creation = creation[0]
+                if isinstance(creation, list): creation = creation[0]
                 if creation:
-                    age_days = (datetime.utcnow() - creation).days
-                    if age_days < 30:
-                        st.warning(f"⚠️ `{netloc}` registered {age_days} days ago (new domain)")
+                    age = (datetime.utcnow() - creation).days
+                    if age < 30:
+                        st.warning(f"⚠️ `{netloc}` is only {age} days old")
                     else:
-                        st.info(f"✅ `{netloc}` age: {age_days:,} days")
+                        st.info(f"✅ `{netloc}` age: {age} days")
                 else:
                     st.info(f"ℹ️ No creation date for `{netloc}`")
             except Exception as e:
-                st.warning(f"❔ WHOIS lookup failed for `{netloc}`: {e}")
+                st.warning(f"❔ WHOIS failed for `{netloc}`: {e}")
 
-    # --- Build Prompt & Call GROQ ---
-    prompt = f"""
-You are an AI cybersecurity assistant. Analyze the following email for phishing threats.
+    # --- Chunk the Message ---
+    chunks = [
+        email_input[i : i + MAX_CHUNK_SIZE]
+        for i in range(0, len(email_input), MAX_CHUNK_SIZE)
+    ]
 
-Sender: {sender_email}
-Message:
-\"\"\"{email_input}\"\"\"
-
-Respond in this format:
-1. Phishing Risk Level: (High / Medium / Low)
-2. Reason: (Why you classified it so)
-3. Recommended Action
-4. Suggested Safe Response (if applicable)
-"""
-    st.markdown("### 🔍 AI Threat Analysis")
-    with st.spinner("Calling GROQ API…"):
+    # --- Analyze Each Chunk ---
+    chunk_analyses = []
+    for idx, chunk in enumerate(chunks, start=1):
+        prompt_chunk = (
+            f"You are a cybersecurity analyst. Here is part {idx}/{len(chunks)} of an email:\n\n"
+            f"\"\"\"{chunk}\"\"\"\n\n"
+            "List any phishing indicators or suspicious elements found."
+        )
         headers = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json"
@@ -113,12 +105,50 @@ Respond in this format:
             "model": "llama3-8b-8192",
             "messages": [
                 {"role": "system", "content": "You are a cybersecurity analyst."},
-                {"role": "user",   "content": prompt}
+                {"role": "user",   "content": prompt_chunk}
             ]
         }
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=data)
+        with st.spinner(f"Analyzing chunk {idx}/{len(chunks)}…"):
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers, json=data, timeout=60
+            )
+        if resp.status_code == 200:
+            chunk_analyses.append(f"### Chunk {idx} Findings\n" +
+                                 resp.json()["choices"][0]["message"]["content"])
+        else:
+            chunk_analyses.append(f"### Chunk {idx} Error: {resp.status_code}")
 
-    if r.status_code == 200:
-        st.markdown(r.json()["choices"][0]["message"]["content"])
+    # --- Final Consolidation ---
+    full_analysis = "\n\n".join(chunk_analyses)
+    final_prompt = (
+        "You are an AI cybersecurity assistant. Based on the following per‑chunk analyses:\n\n"
+        f"{full_analysis}\n\n"
+        "Provide:\n"
+        "1. Overall Phishing Risk Level (High / Medium / Low)\n"
+        "2. Consolidated Reasoning\n"
+        "3. Recommended Action\n"
+        "4. Suggested Safe Response\n"
+        "5. Final Conclusion Summary"
+    )
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": "llama3-8b-8192",
+        "messages": [
+            {"role": "system", "content": "You are a cybersecurity analyst."},
+            {"role": "user",   "content": final_prompt}
+        ]
+    }
+    st.markdown("### 🔍 AI Final Threat Analysis")
+    with st.spinner("Generating final summary…"):
+        final_resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers, json=data, timeout=60
+        )
+    if final_resp.status_code == 200:
+        st.markdown(final_resp.json()["choices"][0]["message"]["content"])
     else:
-        st.error(f"Error {r.status_code}: {r.text}")
+        st.error(f"Error {final_resp.status_code}: {final_resp.text}")
